@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+nupkg/
+
+# Visual Studio
+*.user
+*.suo
+.vs/
+
+# 调试用 HTML 样本（含登录态个人信息，不提交）
+返回值案例/
+
+# 本地翻译词典（可选，如不想共享则取消注释）
+# trans_dict.txt

@@ -1,0 +1,53 @@
+Cylindrical Roller Bearing Single Row	单列圆柱滚子轴承
+Angular Contact Ball Bearing Single Row	单列角接触球轴承
+Deep Groove Ball Bearing Single Row	单列深沟球轴承
+Deep Groove Ball Bearing Double Row	双列深沟球轴承
+Spherical Roller Bearing	调心滚子轴承
+Tapered Roller Bearing Single Row	单列圆锥滚子轴承
+Tapered Roller Bearing Double Row	双列圆锥滚子轴承
+Self-Aligning Ball Bearing	调心球轴承
+Needle Roller Bearing	滚针轴承
+Thrust Ball Bearing	推力球轴承
+Thrust Roller Bearing	推力滚子轴承
+Angular Contact Ball Bearing Double Row	双列角接触球轴承
+Cylindrical Roller Bearing Double Row	双列圆柱滚子轴承
+C - Cylindrical Bore	C - 圆柱孔
+T - Tapered Bore 1:12	T - 锥形孔 1:12
+T - Tapered Bore 1:30	T - 锥形孔 1:30
+No Seal	无密封件
+Sealed on both sides	两侧密封
+Sealed on one side	单侧密封
+Shielded on both sides	两侧防护 
+Shielded on one side	单侧防护
+P - Plastic Molded Cage	P - 玻纤增强尼龙保持架
+M - Machined Brass Cage	M - 机加工黄铜保持架
+MP - Machined Brass Cage, Window Type	MP - 窗式机加工黄铜保持架
+J - Press-formed Sheet Steel Cage	J - 冲压钢板保持架
+CA - Machined Brass Cage, Outer Ring Rolling	CA - 外圈滚体引导机加工黄铜保持架
+No External Modification	无外部改装
+No External Modification Applied	无外部改装
+Cn Normal Internal Play	Cn 正常游隙
+C3 Internal Play (Higher than Cn)	C3 游隙（大于Cn）
+C4 Internal Play (Higher than C3)	C4 游隙（大于C3）
+C2 Internal Play (Lower than Cn)	C2 游隙（小于Cn）
+Standard Precision	标准精度
+P6 - Dimensional And Running Accuracy	P6 - 尺寸及旋转精度
+P5 - Dimensional And Running Accuracy	P5 - 尺寸及旋转精度
+P4 - Dimensional And Running Accuracy	P4 - 尺寸及旋转精度
+No Heat Stabilization - Temperatures up to 120 °C	无热稳定处理 - 最高使用温度120°C
+S1 - Heat Stabilization up to 150 °C	S1 - 热稳定处理至150°C
+S2 - Heat Stabilization up to 200 °C	S2 - 热稳定处理至200°C
+S3 - Heat Stabilization up to 250 °C	S3 - 热稳定处理至250°C
+Angular contact ball bearing 73..-B-XL-MP, single row	角接触球轴承73..-B-XL-MP，单列
+Cylindrical roller bearing NU..-E-XL-TVP2, with cage, single row, non-locating bearing, 2 ribs on outer ring, 0 ribs on inner ring, rolling element riding plastic cage	单列圆柱滚子轴承NU..-E-XL-TVP2，带保持架，非定位轴承，外圈2肋，内圈无肋，滚动体引导塑料保持架
+Increased Load Capacity	增强承载能力
+X-Life	X-Life（超长寿命）
+Machined Brass Cage, Window Type, Rolling Element Riding	窗式机加工黄铜保持架，滚动体引导
+Solid Window Cage Made From Glass Fibre Reinforced Polyamide PA66. Roller Riding	玻纤增强PA66尼龙实体窗型保持架，滚动体引导
+40° Contact Angle	40°接触角
+Universal Mounting, With O Preload	万能安装，O型预紧
+Universal Mounting, With A Preload	万能安装，A型预紧
+Axial Clearance/Preload, Undefined	轴向游隙/预紧量未定义
+Dimensional And Running Accuracy	尺寸及旋转精度
+Steel	钢
+Ceramic	陶瓷

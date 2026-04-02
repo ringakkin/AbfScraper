@@ -7,7 +7,7 @@ Imports System.Collections.Generic
 Public Class BearingResult
 
     ' ── 以下三项为程序集内部字段，外部调用方不可见 ──
-    Friend Property RawData As New Dictionary(Of String, String)
+    Friend Property RawData As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
     Friend Property DetailUrl As String = ""
     Friend Property ProductName As String = ""
 

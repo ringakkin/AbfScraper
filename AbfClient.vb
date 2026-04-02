@@ -20,6 +20,20 @@ Imports HtmlAgilityPack
 
         Private Const BaseUrl As String = "https://www.abf.store"
 
+        ' SuffixDescription 解析时排除的已知字段名集合（类级别共享，避免每次 FetchDetail 重建）
+        Private Shared ReadOnly KnownRawKeys As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase) From {
+            "Availability", "Brand", "Item Number", "Manufacturer Part Number",
+            "Also known as", "EAN", "Category", "Pairing",
+            "Axial Internal Clearance / Preload", "Lubrication", "Medias description",
+            "Radial Internal Play", "Precision", "Heat Stabilization",
+            "Inner (d) MM", "Outer (D) MM", "Width (B) MM",
+            "Inner (d) Inch", "Outer (D) Inch", "Width (B) Inch",
+            "Weight (kg)", "Bore", "Seal", "Cage Type", "External Modification",
+            "Basic Static Load Rating", "Basic Dynamic Load Rating",
+            "Limiting Speed", "Reference Speed",
+            "ECLASS", "ECLASS2"
+        }
+
         Private ReadOnly _handler As HttpClientHandler
         Private ReadOnly _http As HttpClient
         Private _isLoggedIn As Boolean = False
@@ -27,25 +41,44 @@ Imports HtmlAgilityPack
         Private _enableTranslation As Boolean = False
         Private _searchTimeoutSec As Integer = 120
 
+        ''' <summary>
+        ''' 上次 Search() 调用的停止原因。可能值：
+        ''' "OK" = 正常完成（全部结果已采集）；
+        ''' "达到上限" = 达到 maxResults 限制；
+        ''' "超时" = 超过 timeoutSeconds；
+        ''' "列表页失败" = 列表页请求 3 次均失败，已返回部分数据；
+        ''' "Session过期" = 登录状态已失效，请重新调用 Login()。
+        ''' </summary>
+        Public Property LastSearchInfo As String = "OK"
+
         ' ────────────────────────────────────────────────────
         '  构造函数
         ' ────────────────────────────────────────────────────
 
-        ''' <param name="dictPath">持久化词典文件路径，留空则自动使用程序目录下的 trans_dict.txt</param>
-        ''' <param name="translationProvider">翻译后端，默认 MyMemory（无需 Key）；国内推荐 Baidu。</param>
-        ''' <param name="baiduAppId">百度翻译 AppId（仅 Baidu 模式需要）。</param>
-        ''' <param name="baiduSecretKey">百度翻译 SecretKey（仅 Baidu 模式需要）。</param>
-        Public Sub New(Optional dictPath As String = "",
-                       Optional translationProvider As TranslationProvider = TranslationProvider.MyMemory,
-                       Optional baiduAppId As String = "",
-                       Optional baiduSecretKey As String = "")
-            _translator = New AbfTranslator(translationProvider, baiduAppId, baiduSecretKey, dictPath)
-            ServicePointManager.SecurityProtocol = ServicePointManager.SecurityProtocol Or SecurityProtocolType.Tls12
+        ''' <param name="baiduAppId">百度翻译 AppId。</param>
+        ''' <param name="baiduSecretKey">百度翻译 SecretKey。</param>
+        ''' <param name="dictPath">持久化词典文件路径，留空则自动使用程序目录下的 trans_dict.txt。</param>
+        Public Sub New(Optional baiduAppId As String = "",
+                       Optional baiduSecretKey As String = "",
+                       Optional dictPath As String = "")
+            _translator = New AbfTranslator(baiduAppId, baiduSecretKey, dictPath)
             _handler = New HttpClientHandler() With {
                 .CookieContainer = New CookieContainer(),
                 .UseCookies = True,
-                .AllowAutoRedirect = True
+                .AllowAutoRedirect = True,
+                .ServerCertificateCustomValidationCallback =
+                    Function(msg, cert, chain, errs) errs = Net.Security.SslPolicyErrors.None
             }
+            ' 强制 TLS 1.2，避免 TLS 1.3 ClientHello 在某些网络被 RST
+            ' netstandard2.0 不含 SslProtocols 属性，用反射在运行时设置（net5+ 有此属性）
+            Try
+                Dim sslProp = _handler.GetType().GetProperty("SslProtocols")
+                If sslProp IsNot Nothing Then
+                    sslProp.SetValue(_handler,
+                        System.Security.Authentication.SslProtocols.Tls12)
+                End If
+            Catch
+            End Try
             _http = New HttpClient(_handler) With {
                 .Timeout = System.Threading.Timeout.InfiniteTimeSpan
             }
@@ -79,69 +112,71 @@ Imports HtmlAgilityPack
                 Throw New ArgumentException("password 不能为空", NameOf(password))
             End If
 
-            ' ── Step 1：GET 首页，取 CSRF Token ──
-            Dim homeHtml As String
-            Try
-                homeHtml = FetchHtml(BaseUrl & "/s/en/")
-            Catch ex As Exception
-                Throw New Exception("登录失败：无法访问 ABF Store。" & ex.Message, ex)
-            End Try
+            Using loginCts As New System.Threading.CancellationTokenSource(
+                    TimeSpan.FromSeconds(120))
 
-            Dim doc As New HtmlDocument()
-            doc.LoadHtml(homeHtml)
-
-            Dim tokenNode = doc.DocumentNode.SelectSingleNode(
-                "//input[@name='__RequestVerificationToken']")
-            If tokenNode Is Nothing Then
-                Throw New Exception(
-                    "登录失败：找不到 CSRF Token，页面结构可能已变更。")
-            End If
-            Dim token = tokenNode.GetAttributeValue("value", "")
-
-            ' ── Step 2：POST 登录 ──
-            Dim formData As New List(Of KeyValuePair(Of String, String)) From {
-                New KeyValuePair(Of String, String)(
-                    "__RequestVerificationToken", token),
-                New KeyValuePair(Of String, String)("username", username),
-                New KeyValuePair(Of String, String)("password", password),
-                New KeyValuePair(Of String, String)("remember", "true"),
-                New KeyValuePair(Of String, String)("redirectUri", "")
-            }
-
-            Dim request As New HttpRequestMessage(
-                HttpMethod.Post, BaseUrl & "/s/data/auth/login")
-            request.Content = New FormUrlEncodedContent(formData)
-            request.Headers.Referrer = New Uri(BaseUrl & "/s/en/")
-
-            Dim response As HttpResponseMessage
-            Using cts1 As New System.Threading.CancellationTokenSource(
-                    If(_searchTimeoutSec <= 0, System.Threading.Timeout.InfiniteTimeSpan, TimeSpan.FromSeconds(_searchTimeoutSec)))
-                response = _http.SendAsync(request, cts1.Token).GetAwaiter().GetResult()
-            End Using
-            Dim body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-            ' 响应 JSON 示例：{"IsValid":true,"RedirectUri":null,...}
-            _isLoggedIn = body.IndexOf("""IsValid"":true",
-                                       StringComparison.OrdinalIgnoreCase) >= 0
-
-            ' ── Step 3：登录成功后确保货币为 EUR ──
-            If _isLoggedIn Then
+                ' ── Step 1：GET 首页，取 CSRF Token ──
+                Dim homeHtml As String
                 Try
-                    Dim currReq As New HttpRequestMessage(
-                        HttpMethod.Post, BaseUrl & "/s/data/currency")
-                    currReq.Content = New FormUrlEncodedContent(
-                        New List(Of KeyValuePair(Of String, String)) From {
-                            New KeyValuePair(Of String, String)("currency", "EUR")
-                        })
-                    currReq.Headers.Referrer = New Uri(BaseUrl & "/s/en/")
-                    Using cts2 As New System.Threading.CancellationTokenSource(
-                            If(_searchTimeoutSec <= 0, System.Threading.Timeout.InfiniteTimeSpan, TimeSpan.FromSeconds(_searchTimeoutSec)))
-                        _http.SendAsync(currReq, cts2.Token).GetAwaiter().GetResult()
-                    End Using
-                Catch
-                    ' 货币设置失败不阻断流程，继续应用帐号默认货币
+                    homeHtml = FetchHtml(BaseUrl & "/s/en/", loginCts.Token)
+                Catch ex As Exception
+                    Throw New Exception("登录失败：无法访问 ABF Store。" & ex.Message, ex)
                 End Try
-            End If
+
+                Dim doc As New HtmlDocument()
+                doc.LoadHtml(homeHtml)
+
+                Dim tokenNode = doc.DocumentNode.SelectSingleNode(
+                    "//input[@name='__RequestVerificationToken']")
+                If tokenNode Is Nothing Then
+                    Throw New Exception(
+                        "登录失败：找不到 CSRF Token，页面结构可能已变更。")
+                End If
+                Dim token = tokenNode.GetAttributeValue("value", "")
+
+                ' ── Step 2：POST 登录 ──
+                Dim formData As New List(Of KeyValuePair(Of String, String)) From {
+                    New KeyValuePair(Of String, String)(
+                        "__RequestVerificationToken", token),
+                    New KeyValuePair(Of String, String)("username", username),
+                    New KeyValuePair(Of String, String)("password", password),
+                    New KeyValuePair(Of String, String)("remember", "true"),
+                    New KeyValuePair(Of String, String)("redirectUri", "")
+                }
+
+                Dim request As New HttpRequestMessage(
+                    HttpMethod.Post, BaseUrl & "/s/data/auth/login")
+                request.Content = New FormUrlEncodedContent(formData)
+                request.Headers.Referrer = New Uri(BaseUrl & "/s/en/")
+
+                Dim body As String
+                Using response = _http.SendAsync(request, loginCts.Token).GetAwaiter().GetResult()
+                    body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                End Using
+
+                ' 响应 JSON 示例：{"IsValid":true,"RedirectUri":null,...}
+                _isLoggedIn = Regex.IsMatch(body,
+                    """IsValid""\s*:\s*true",
+                    RegexOptions.IgnoreCase)
+
+                ' ── Step 3：登录成功后确保货币为 EUR ──
+                If _isLoggedIn Then
+                    Try
+                        Dim currReq As New HttpRequestMessage(
+                            HttpMethod.Post, BaseUrl & "/s/data/currency")
+                        currReq.Content = New FormUrlEncodedContent(
+                            New List(Of KeyValuePair(Of String, String)) From {
+                                New KeyValuePair(Of String, String)("currency", "EUR")
+                            })
+                        currReq.Headers.Referrer = New Uri(BaseUrl & "/s/en/")
+                        Using _http.SendAsync(currReq, loginCts.Token).GetAwaiter().GetResult()
+                        End Using
+                    Catch
+                        ' 货币设置失败不阻断流程，继续应用帐号默认货币
+                    End Try
+                End If
+
+            End Using
 
             Return _isLoggedIn
         End Function
@@ -156,10 +191,13 @@ Imports HtmlAgilityPack
         ''' <param name="maxResults">最多返回条数，0 表示不限制（返回全部）。实际结果少于该値时返回实际数量。</param>
         ''' <param name="enableTranslation">是否将英文字段翻译为中文，默认 False。</param>
         ''' <param name="imageSavePath">图片存储路径（可选）。不为空时自动创建目录并下载图片，留空则不下载。</param>
+        ''' <param name="maxConcurrent">详情页并发请求数，默认 1（串行）。调大可提升速度，建议不超过 5，过高可能触发服务器限速。</param>
+        ''' <param name="onProgress">可选进度回调，每页详情抓完后触发。参数1=已采集条数，参数2=网站报告总条数（首页前为0）。VBA 调用时传 Nothing。</param>
+        ''' <param name="page">分页模式：0（默认）= 自动翻全部页返回所有结果；N（正整数）= 只抓第 N 页（50条）立刻返回。分页模式下客户端自己控制循环，可实现断点续传。</param>
         ''' <returns>
         ''' 二维字符串数组 String(,)，行下标从 0 起（结果序号），列下标从 1 起（字段序号 1~21）。
         ''' arr(i,0)=总条数，arr(i,1)=结果型号，arr(0,2)=第一条简述，arr(1,1)=第二条结果…
-        ''' 若无结果则返回 String(0,0){}。
+        ''' 若无结果则返回行数为 0 的空数组（GetLength(0) = 0）。
         ''' </returns>
         Public Function Search(model As String,
                                brand As String,
@@ -167,9 +205,15 @@ Imports HtmlAgilityPack
                                Optional timeoutSeconds As Integer = 120,
                                Optional maxResults As Integer = 0,
                                Optional enableTranslation As Boolean = False,
-                               Optional imageSavePath As String = "") As String(,)
+                               Optional imageSavePath As String = "",
+                               Optional maxConcurrent As Integer = 1,
+                               Optional onProgress As Action(Of Integer, Integer) = Nothing,
+                               Optional page As Integer = 0) As String(,)
+            If model Is Nothing Then model = ""
+            If brand Is Nothing Then brand = ""
             _searchTimeoutSec = timeoutSeconds
             _enableTranslation = enableTranslation
+            LastSearchInfo = "OK"
             If Not _isLoggedIn Then
                 Throw New InvalidOperationException(
                     "尚未登录，请先调用 Login() 方法。")
@@ -184,35 +228,61 @@ Imports HtmlAgilityPack
             Dim query = Uri.EscapeDataString(
                             (model.Trim() & " " & brand.Trim()).Trim())
 
-            ' ── Step 2：提取搜索结果列表中所有详情页的 href（含分页循环）──
+            ' ── Step 2+3：逐页采集——先取本页列表 href，立即抓详情，再翻下一页 ──
+            ' 好处：超时发生时已完成的页有完整数据，不会因"先收全部 URL 再抓详情"而空手而回
             ' p=页码（1-indexed），mx=每页条数；每次取50条，直到当页原始行数 < mx 为止
             ' os=库存过滤器：0=全部 1=有货 2=限时优惠，固定为 0（不过滤）
             Const PageSize As Integer = 50
             Dim rowMeta As New Dictionary(Of String, String())
             Dim seen As New HashSet(Of String)
-            Dim detailHrefs As New List(Of String)
-            Dim pageNum As Integer = 1
+            Dim pageNum As Integer = If(page > 0, page, 1)
             Dim totalProductCount As Integer = 0
+            Dim results As New List(Of BearingResult)
+            Dim resultIndex As Integer = If(page > 0, (page - 1) * PageSize + 1, 1)
 
             Do
                 Dim searchUrl = $"{BaseUrl}/s/en/search/" &
                                 $"?st=text&t={matchParam}&q={query}" &
                                 $"&ob=0&vw=basic&os=0&mx={PageSize}&p={pageNum}"
 
-                Dim html As String
-                Try
-                    html = FetchHtml(searchUrl, token)
-                Catch ex As OperationCanceledException
+                ' ── 列表页抓取（最多重试 3 次，全部失败则返回已有部分结果）──
+                Dim html As String = ""
+                Dim listFetchOk As Boolean = False
+                Dim listCancelled As Boolean = False
+                For _retry = 0 To 2
+                    Try
+                        html = FetchHtml(searchUrl, token)
+                        listFetchOk = True
+                        Exit For
+                    Catch ex As OperationCanceledException
+                        listCancelled = True
+                        Exit For
+                    Catch ex As Exception
+                        If _retry < 2 Then
+                            Try
+                                System.Threading.Tasks.Task.Delay(
+                                    2000 * (_retry + 1), token).GetAwaiter().GetResult()
+                            Catch
+                                listCancelled = True
+                                Exit For
+                            End Try
+                        End If
+                    End Try
+                Next
+                If listCancelled Then
+                    LastSearchInfo = "超时"
                     Exit Do
-                Catch ex As Exception
-                    Throw New Exception("搜索请求失败：" & ex.Message, ex)
-                End Try
+                End If
+                If Not listFetchOk Then
+                    LastSearchInfo = "列表页失败"
+                    Exit Do
+                End If
 
                 Dim doc As New HtmlDocument()
                 doc.LoadHtml(html)
 
-                ' 首页时解析网站公布的总条数（如 "13,791 products found"）
-                If pageNum = 1 Then
+                ' 解析网站公布的总条数（如 "13,791 products found"），仅首次获取到时记录
+                If totalProductCount = 0 Then
                     Dim countM = Regex.Match(html, "(\d[\d,\.]*)\s+products?\s+found", RegexOptions.IgnoreCase)
                     If countM.Success Then
                         Dim raw = Regex.Replace(countM.Groups(1).Value, "[^\d]", "")
@@ -223,7 +293,18 @@ Imports HtmlAgilityPack
                 Dim rows = doc.DocumentNode.SelectNodes(
                     "//li[contains(@class,'result-row')]")
                 Dim rawRowCount As Integer = If(rows IsNot Nothing, rows.Count, 0)
-                Dim prevCount = detailHrefs.Count
+
+                ' ── 检测 Session 是否过期（服务器返回了登录页而非搜索结果页）──
+                If rawRowCount = 0 Then
+                    Dim loginIndicator = doc.DocumentNode.SelectSingleNode(
+                        "//input[@type='password']")
+                    If loginIndicator IsNot Nothing Then
+                        _isLoggedIn = False
+                        LastSearchInfo = "Session过期"
+                        Exit Do
+                    End If
+                End If
+                Dim pageHrefs As New List(Of String)
                 If rows IsNot Nothing Then
                     For Each row In rows
                     ' ── 定位产品详情页 href ──
@@ -259,7 +340,7 @@ Imports HtmlAgilityPack
                     End If
                     If String.IsNullOrEmpty(rowHref) Then Continue For
                     If Not seen.Add(rowHref) Then Continue For
-                    detailHrefs.Add(rowHref)
+                    pageHrefs.Add(rowHref)
 
                     ' ── 从行内文本提取库存、价格、简述 ──
                     Dim listStock = ""
@@ -285,61 +366,93 @@ Imports HtmlAgilityPack
                 Next
                 End If
 
-                ' 当页原始行数不足 PageSize，说明已是最后一页
+                ' ── 立即抓取本页的详情页（支持并发） ──
+                ' 先按 maxResults 截断本页 href 列表
+                Dim batchHrefs = If(maxResults > 0 AndAlso pageHrefs.Count > maxResults - results.Count,
+                                    pageHrefs.GetRange(0, Math.Max(0, maxResults - results.Count)),
+                                    pageHrefs)
+
+                If maxConcurrent <= 1 Then
+                    ' ── 串行模式（原有逻辑） ──
+                    For Each href In batchHrefs
+                        Dim detailUrl = BaseUrl & href
+                        Try
+                            Dim result = FetchDetail(detailUrl, imageSavePath, resultIndex, token)
+                            result.DetailUrl = detailUrl
+                            MergeRowMeta(result, href, rowMeta)
+                            results.Add(result)
+                        Catch ex As OperationCanceledException
+                            Exit For
+                        Catch ex As Exception
+                            Dim errResult As New BearingResult() With {.DetailUrl = detailUrl}
+                            MergeRowMeta(errResult, href, rowMeta)
+                            errResult.ShortDescription = "[Error] " & ex.Message
+                            results.Add(errResult)
+                        End Try
+                        resultIndex += 1
+                    Next
+                Else
+                    ' ── 并发模式：Parallel.ForEach + MaxDegreeOfParallelism ──
+                    ' 比 SemaphoreSlim+Task.WhenAll 更好：不会因 50 个任务全部阻塞线程池线程而退化为串行
+                    Dim pageResults(batchHrefs.Count - 1) As BearingResult
+                    Dim poptions As New System.Threading.Tasks.ParallelOptions() With {
+                        .MaxDegreeOfParallelism = Math.Max(1, maxConcurrent),
+                        .CancellationToken = token
+                    }
+                    Try
+                        System.Threading.Tasks.Parallel.ForEach(
+                            Enumerable.Range(0, batchHrefs.Count),
+                            poptions,
+                            Sub(idx)
+                                Dim localHref = batchHrefs(idx)
+                                Dim localUrl = BaseUrl & localHref
+                                Dim localRIdx = resultIndex + idx
+                                Try
+                                    Dim r = FetchDetail(localUrl, imageSavePath, localRIdx, token)
+                                    r.DetailUrl = localUrl
+                                    MergeRowMeta(r, localHref, rowMeta)
+                                    pageResults(idx) = r
+                                Catch ex As OperationCanceledException
+                                    pageResults(idx) = Nothing
+                                Catch ex As Exception
+                                    Dim errResult As New BearingResult() With {.DetailUrl = localUrl}
+                                    MergeRowMeta(errResult, localHref, rowMeta)
+                                    errResult.ShortDescription = "[Error] " & ex.Message
+                                    pageResults(idx) = errResult
+                                End Try
+                            End Sub)
+                    Catch ex As OperationCanceledException
+                    Catch ex As AggregateException
+                    End Try
+                    For Each r In pageResults
+                        If r IsNot Nothing Then results.Add(r)
+                    Next
+                    resultIndex += batchHrefs.Count
+                End If
+
+                ' ── 进度回调（每页详情抓完后触发）──
+                If onProgress IsNot Nothing Then
+                    onProgress(results.Count, totalProductCount)
+                End If
+
+                ' 已超时：优先检查，避免被 rawRowCount<PageSize 掩盖而错报 "OK"
+                If token.IsCancellationRequested Then
+                    LastSearchInfo = "超时"
+                    Exit Do
+                End If
+                ' 当页原始行数不足 PageSize，说明已是最后一页（含0行的情况）
                 If rawRowCount < PageSize Then Exit Do
-                ' 当页无新增 href（服务器返回重复内容，分页失效），立即退出
-                If detailHrefs.Count = prevCount Then Exit Do
-                ' 已收集足够多的 href 时提前退出分页，避免多余请求
-                If maxResults > 0 AndAlso detailHrefs.Count >= maxResults Then Exit Do
+                ' 当页无新增 href：服务器分页失效（重复返回同一页），防止无限循环
+                If pageHrefs.Count = 0 Then Exit Do
+                ' 已达到 maxResults 上限，停止翻页
+                If maxResults > 0 AndAlso results.Count >= maxResults Then
+                    LastSearchInfo = "达到上限"
+                    Exit Do
+                End If
+                ' 单页模式：只抓指定页，完成后立刻退出
+                If page > 0 Then Exit Do
                 pageNum += 1
             Loop
-
-            ' 按 maxResults 截断结果列表
-            If maxResults > 0 AndAlso detailHrefs.Count > maxResults Then
-                detailHrefs = detailHrefs.GetRange(0, maxResults)
-            End If
-
-            ' ── Step 3：逐一抓取详情页 ──
-            Dim results As New List(Of BearingResult) ' 内部仍用列表，最后转二维数组
-            Dim resultIndex As Integer = 1
-            For Each href In detailHrefs
-                Dim detailUrl = BaseUrl & href
-                Try
-                    Dim result = FetchDetail(detailUrl, imageSavePath, resultIndex, token)
-                    result.DetailUrl = detailUrl
-
-                    ' 合并列表页预采集的库存、价格、简述
-                    Dim meta() As String = Nothing
-                    If rowMeta.TryGetValue(href, meta) Then
-                        If result.Stock = "|" AndAlso Not String.IsNullOrEmpty(meta(0)) Then
-                            result.Stock = meta(0)
-                        End If
-                        ' Price 格式：原价|折扣价（仅在 FetchDetail 未采集到价格时使用列表页数据，避免覆盖详情页已获取的折扣价）
-                        If result.Price = "|" AndAlso Not String.IsNullOrWhiteSpace(meta(1)) Then
-                            Dim discPart = If(meta.Length > 4, meta(4), "")
-                            result.Price = meta(1) & "|" & discPart
-                        End If
-                        If meta.Length > 2 AndAlso Not String.IsNullOrEmpty(meta(2)) Then
-                            result.ShortDescription = meta(2)
-                        End If
-                        If meta.Length > 3 AndAlso Not String.IsNullOrEmpty(meta(3)) Then
-                            result.ResultName = meta(3)
-                        End If
-                    End If
-
-                    results.Add(result)
-                Catch ex As OperationCanceledException
-                    Exit For
-                Catch ex As Exception
-                    ' 单条失败不影响整体，返回含错误信息的占位对象
-                    Dim errResult As New BearingResult() With {
-                        .DetailUrl = detailUrl,
-                        .ShortDescription = "[Error] " & ex.Message
-                    }
-                    results.Add(errResult)
-                End Try
-                resultIndex += 1
-            Next
 
             ' ── 转换为二维字符串数组（行 0-based，列 0-based）──
             ' arr(i,0)=总条数，arr(i,1)~arr(i,21) = 字段 1~21
@@ -361,6 +474,25 @@ Imports HtmlAgilityPack
         ' ────────────────────────────────────────────────────
         '  私有方法
         ' ────────────────────────────────────────────────────
+
+        Private Shared Sub MergeRowMeta(result As BearingResult, href As String,
+                                        rowMeta As Dictionary(Of String, String()))
+            Dim meta() As String = Nothing
+            If Not rowMeta.TryGetValue(href, meta) Then Return
+            If result.Stock = "|" AndAlso Not String.IsNullOrEmpty(meta(0)) Then
+                result.Stock = meta(0)
+            End If
+            If result.Price = "|" AndAlso Not String.IsNullOrWhiteSpace(meta(1)) Then
+                Dim discPart = If(meta.Length > 4, meta(4), "")
+                result.Price = meta(1) & "|" & discPart
+            End If
+            If meta.Length > 2 AndAlso Not String.IsNullOrEmpty(meta(2)) Then
+                result.ShortDescription = meta(2)
+            End If
+            If meta.Length > 3 AndAlso Not String.IsNullOrEmpty(meta(3)) Then
+                result.ResultName = meta(3)
+            End If
+        End Sub
 
         Private Function FetchDetail(detailUrl As String,
                                      Optional imageSavePath As String = "",
@@ -520,8 +652,9 @@ Imports HtmlAgilityPack
                     End If
                     If Not String.IsNullOrEmpty(formerEurPrice) Then
                         result.Price = formerEurPrice & "|" & currentEurPrice
+                    Else
+                        result.Price = currentEurPrice & "|"   ' 普通正价（无折扣）
                     End If
-                    ' formerEurPrice 为空时保留默认 "|"，让列表页 merge 提供原价|折扣价
                 End If
             Else
                 ' 备用：JSON 正则，只搜索 equivalents 区块之前的 HTML
@@ -551,8 +684,9 @@ Imports HtmlAgilityPack
                                 NormalizeEuro(HtmlEntity.DeEntitize(formerNode.InnerText.Trim())), "")
                             If jsonFormerText.Length > 0 AndAlso jsonFormerText(0) = ChrW(8364) Then
                                 result.Price = jsonFormerText & "|" & currentText
+                            Else
+                                result.Price = currentText & "|"   ' 普通正价（无折扣）
                             End If
-                            ' 否则保留默认 "|"，让列表页 merge 提供原价|折扣价
                         End If
                     End If
                 End If
@@ -561,25 +695,13 @@ Imports HtmlAgilityPack
             ' SuffixDescription：将所有后缀 key=value 拼接，格式：后缀1=说明1|后缀2=说明2|…
             ' 后缀条目特征：不属于常规 Specifications 字段，且 key 往往是简短大写编码
             ' 此处简化规则：不属于已知字段的 RawData 条目就当作后缀拆分拼入
-            Dim knownKeys As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase) From {
-                "Availability", "Brand", "Item Number", "Manufacturer Part Number",
-                "Also known as", "EAN", "Category", "Pairing",
-                "Axial Internal Clearance / Preload", "Lubrication", "Medias description",
-                "Radial Internal Play", "Precision", "Heat Stabilization",
-                "Inner (d) MM", "Outer (D) MM", "Width (B) MM",
-                "Inner (d) Inch", "Outer (D) Inch", "Width (B) Inch",
-                "Weight (kg)", "Bore", "Seal", "Cage Type", "External Modification",
-                "Basic Static Load Rating", "Basic Dynamic Load Rating",
-                "Limiting Speed", "Reference Speed",
-                "ECLASS", "ECLASS2"
-            }
             Dim suffixParts As New List(Of String)
             For Each kv In result.RawData
-                If Not knownKeys.Contains(kv.Key) Then
+                If Not KnownRawKeys.Contains(kv.Key) Then
                     ' 格式：KEY|英文|中文
                     Dim keyVal = kv.Key
                     Dim engVal = kv.Value
-                    Dim zhVal = Translate(engVal)
+                    Dim zhVal = Translate(engVal, ct)
                     suffixParts.Add($"{keyVal}|{engVal}|{zhVal}")
                 End If
             Next
@@ -624,9 +746,12 @@ Imports HtmlAgilityPack
 
             Dim nameList As New List(Of String)
             For idx = 0 To imgUrls.Count - 1
-                Dim ext = Path.GetExtension(
-                    New Uri(imgUrls(idx)).AbsolutePath)
-                If String.IsNullOrEmpty(ext) Then ext = ".jpg"
+                Dim ext As String = ".jpg"
+                Try
+                    ext = Path.GetExtension(New Uri(imgUrls(idx)).AbsolutePath)
+                    If String.IsNullOrEmpty(ext) Then ext = ".jpg"
+                Catch
+                End Try
 
                 ' 命名规则：型号-结果序号-图片序号（示例：NU324ETVP2FAG-1-1.png）
                 Dim baseName = $"{searchSlug}-{resultIndex}-{idx + 1}{ext}"
@@ -641,6 +766,8 @@ Imports HtmlAgilityPack
                             Dim bytes = FetchBytes(imgUrls(idx), ct)
                             File.WriteAllBytes(saveTo, bytes)
                         End If
+                    Catch ex As OperationCanceledException
+                        Throw
                     Catch ex As Exception
                         ' 单张下载失败不阻断整体
                     End Try
@@ -653,7 +780,7 @@ Imports HtmlAgilityPack
             Dim trans = Function(s As String) As String
                             Dim en = s.Split("|"c)(0)
                             If String.IsNullOrWhiteSpace(en) Then Return s
-                            Dim zh = Translate(en)
+                            Dim zh = Translate(en, ct)
                             Return en & "|" & zh
                         End Function
 
@@ -683,12 +810,18 @@ Imports HtmlAgilityPack
 
             Dim renderUrl = ajaxNode.GetAttributeValue("data-renderurl", "")
             If String.IsNullOrEmpty(renderUrl) Then Return "|"
-            If renderUrl.StartsWith("/") Then renderUrl = BaseUrl & renderUrl
+            If renderUrl.StartsWith("//") Then
+                renderUrl = "https:" & renderUrl
+            ElseIf renderUrl.StartsWith("/") Then
+                renderUrl = BaseUrl & renderUrl
+            End If
 
             ' 请求 AJAX 接口获取渲染后的 HTML 片段
             Dim equivHtml As String
             Try
                 equivHtml = FetchHtml(renderUrl, ct)
+            Catch ex As OperationCanceledException
+                Throw
             Catch
                 Return "|"
             End Try
@@ -803,7 +936,8 @@ Imports HtmlAgilityPack
                 If t = "" Then Continue For
 
                 If stockOut = "" AndAlso
-                   (t.EndsWith(" pc") OrElse t.EndsWith(" pcs")) Then
+                   (t.EndsWith(" pc", StringComparison.OrdinalIgnoreCase) OrElse
+                    t.EndsWith(" pcs", StringComparison.OrdinalIgnoreCase)) Then
                     stockOut = t
                 End If
                 If t.Length > 0 AndAlso t(0) = ChrW(8364) Then
@@ -812,7 +946,14 @@ Imports HtmlAgilityPack
                     Dim tagName = leaf.Name.ToLowerInvariant()
                     If cls.Contains("former-price") OrElse cls.Contains("strikethrough") OrElse
                        tagName = "del" OrElse tagName = "s" Then
-                        priceOut = t
+                        If priceOut = "" Then
+                            priceOut = t
+                        Else
+                            ' priceOut 已被当前价占据（元素顺序：当前价→原价）
+                            ' 把原价移到 priceOut，当前价降为 discountPriceOut
+                            discountPriceOut = priceOut
+                            priceOut = t
+                        End If
                     ElseIf cls.Contains("price") Then
                         If priceOut = "" Then
                             priceOut = t              ' 无折扣时直接作为原价
@@ -883,23 +1024,25 @@ Imports HtmlAgilityPack
 
         ''' <summary>带超时的 HTTP GET 请求，返回响应文本。</summary>
         Private Function FetchHtml(url As String, Optional ct As System.Threading.CancellationToken = Nothing) As String
-            Dim resp = _http.GetAsync(url, ct).GetAwaiter().GetResult()
-            resp.EnsureSuccessStatusCode()
-            Dim bytes = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-            Return System.Text.Encoding.UTF8.GetString(bytes)
+            Using resp = _http.GetAsync(url, ct).GetAwaiter().GetResult()
+                resp.EnsureSuccessStatusCode()
+                Dim bytes = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+                Return System.Text.Encoding.UTF8.GetString(bytes)
+            End Using
         End Function
 
         ''' <summary>带超时的 HTTP GET 请求，返回响应字节数组。</summary>
         Private Function FetchBytes(url As String, Optional ct As System.Threading.CancellationToken = Nothing) As Byte()
-            Dim resp = _http.GetAsync(url, ct).GetAwaiter().GetResult()
-            resp.EnsureSuccessStatusCode()
-            Return resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+            Using resp = _http.GetAsync(url, ct).GetAwaiter().GetResult()
+                resp.EnsureSuccessStatusCode()
+                Return resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+            End Using
         End Function
 
         ''' <summary>将英文翻译为中文。enableTranslation=False 时直接返回空字符串（回退英文由调用方处理）。</summary>
-        Private Function Translate(text As String) As String
+        Private Function Translate(text As String, Optional ct As System.Threading.CancellationToken = Nothing) As String
             If Not _enableTranslation Then Return ""
-            Return _translator.Translate(text)
+            Return _translator.Translate(text, ct)
         End Function
 
 

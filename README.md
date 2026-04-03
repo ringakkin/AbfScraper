@@ -4,6 +4,25 @@
 
 ---
 
+## 目录
+
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [API 参考](#api-参考)
+  - [创建客户端](#1-创建客户端-new-abfclient)
+  - [登录](#2-登录-login)
+  - [搜索](#3-搜索-search)
+  - [返回值](#4-返回值)
+  - [单独使用翻译](#5-单独使用翻译-abftranslator)
+- [使用示例](#使用示例)
+- [性能建议](#性能建议)
+- [编译指南（源码）](#编译指南面向拿到源码的客户)
+- [使用指南（DLL）](#使用指南面向拿到-dll-的客户)
+- [常见问题](#常见问题)
+- [限制与注意事项](#限制与注意事项)
+
+---
+
 ## 环境要求
 
 | 条件 | 说明 |
@@ -133,8 +152,6 @@ Dim arr As String(,) = client.Search(
 |---|---|---|---|---|
 | `model` | String | **必填** | 不可省略；可传 `""` 表示不限型号 | 必须传入 |
 | `brand` | String | **必填** | 不可省略；可传 `""` 表示不限品牌 | 必须传入 |
-
-> ⚠️ `model` 和 `brand` **不建议同时为空**。两者均为空时相当于搜索全站，命中数可能超过数十万条；配合 `maxResults` 或 `timeoutSeconds` 加以限制，否则程序会长时间运行并消耗大量内存。
 | `matchMode` | Integer | `1` | 仅 `0`/`1`/`2` 有效；**其他值自动回退为 `1`**（开头匹配） | 按型号前缀搜索 |
 | `timeoutSeconds` | Integer | `120` | `0` 或负数 = 无限等待；正整数 = 超时秒数 | 120 秒超时；数据量大时建议手动调大，如 `600` |
 | `maxResults` | Integer | `0` | `0` 或负数 = 不限制；正整数 N = 最多返回 N 条 | 不限制，返回全部命中结果（受超时控制） |
@@ -143,6 +160,8 @@ Dim arr As String(,) = client.Search(
 | `maxConcurrent` | Integer | `1` | `≤1` = 串行；建议 `2`~`3`；超过 `5` 收益递减且可能触发服务器限速 | 串行，最稳定但最慢 |
 | `onProgress` | Action(Of Integer, Integer) | `Nothing` | 可传 `Nothing`（VBA 调用时传 `Nothing`） | 无进度反馈 |
 | `page` | Integer | `0` | `0` = 自动翻全部页；正整数 N = 只抓第 N 页（每页 50 条） | 自动翻全部页直到搜完或超时 |
+
+> ⚠️ `model` 和 `brand` **不建议同时为空**。两者均为空时相当于搜索全站，命中数可能超过数十万条；配合 `maxResults` 或 `timeoutSeconds` 加以限制，否则程序会长时间运行并消耗大量内存。
 
 > **计算总页数**：`arr(0, 0)` 返回网站总命中条数，`Math.Ceiling(总条数 / 50)` 即为总页数。例如总条数 137 ÷ 50 = 3 页。
 
@@ -500,8 +519,8 @@ Module PagedCrawl
                 ' 保存断点
                 File.WriteAllText(CheckpointFile, (pageNum + 1).ToString())
 
-                ' 本页不足 50 条说明已到末页
-                If n < 50 Then Exit Do
+                ' 当页不足 50 条且非超时截断，才认定已到末页
+                If n < 50 AndAlso client.LastSearchInfo <> "超时" Then Exit Do
 
                 ' Session 过期时重新登录
                 If client.LastSearchInfo = "Session过期" Then
@@ -546,6 +565,229 @@ Module TranslateOnly
     End Sub
 End Module
 ```
+
+### 示例 11：大批量采集并导出到 Excel（20 万条）
+
+> **可行性说明**
+> - 采集速度受服务器响应限制（每条详情页约 3.9 秒），`maxConcurrent=5` 约 **1.25 条/秒**。
+>   20 万条需约 **44 小时**连续运行，建议分批次多天采集，或仅采集特定品牌/型号的子集。
+> - 代码使用 `page` 参数逐页写入，每批仅 50 条数据进内存；但 `XLWorkbook` 对象会随写入行数增长，20 万行时 **ClosedXML 工作簿本身约占 500 MB～1 GB RAM**，请确保运行机器内存充足。
+> - 支持**断点续传**：程序中断后重新运行，自动从上次停止的页码继续，已写入的数据不会丢失。
+> - Excel 行上限 1,048,576，20 万条完全在范围内。
+
+#### 1) 安装 ClosedXML（NuGet）
+
+```
+dotnet add package ClosedXML
+```
+
+或在 `.vbproj` 的 `<ItemGroup>` 中手动添加：
+
+```xml
+<PackageReference Include="ClosedXML" Version="0.102.*" />
+```
+
+#### 2) 示例代码
+
+```vb
+Imports AbfScraper
+Imports ClosedXML.Excel
+Imports System.IO
+
+Module BulkExportToExcel
+
+    Const Email          As String  = "your@email.com"   ' ← 填入账号
+    Const Password       As String  = "your_password"    ' ← 填入密码
+    Const OutputPath     As String  = "C:\bearings\export.xlsx"
+    Const CheckpointFile As String  = "C:\bearings\checkpoint.txt"
+    Const SearchModel    As String  = ""       ' 留空 = 不限型号
+    Const SearchBrand    As String  = "FAG"    ' 品牌，留空 = 全站
+    Const MatchMode      As Integer = 0        ' 0=包含  1=开头  2=精确
+    Const MaxConcurrent  As Integer = 5        ' 并发数，最大 5
+    Const SaveEveryPages As Integer = 2        ' 每 2 页（约 100 条）保存一次，减少意外中断丢失数据的风险
+
+    ' 表头顺序对应 arr(i, 0)~arr(i, 21)
+    ReadOnly Headers As String() = {
+        "总命中", "型号", "简述", "价格", "库存", "等效型号",
+        "产品描述", "别名", "类别", "内径mm", "外径mm", "宽度mm",
+        "重量kg", "孔型", "密封件", "保持架", "外部改装",
+        "径向游隙", "精度", "热稳定", "图片文件名", "后缀描述"
+    }
+
+    Sub Main()
+        Using client As New AbfClient()
+
+            ' ── 登录 ────────────────────────────────────────
+            Console.Write("正在登录... ")
+            Try
+                If Not client.Login(Email, Password) Then
+                    Console.WriteLine("失败（账号或密码错误）")
+                    Return
+                End If
+            Catch ex As Exception
+                Console.WriteLine("失败：" & ex.Message)
+                Return
+            End Try
+            Console.WriteLine("成功")
+
+            ' ── 读取断点 ─────────────────────────────────────
+            Dim startPage As Integer = 1
+            If File.Exists(CheckpointFile) Then
+                Integer.TryParse(File.ReadAllText(CheckpointFile).Trim(), startPage)
+                Console.WriteLine($"从断点恢复：第 {startPage} 页")
+            End If
+
+            ' ── 打开已有工作簿（续写）或新建 ─────────────────
+            Dim wb As XLWorkbook
+            Dim ws As IXLWorksheet
+            Dim nextRow As Integer
+
+            If startPage > 1 AndAlso File.Exists(OutputPath) Then
+                wb      = New XLWorkbook(OutputPath)
+                ws      = wb.Worksheet(1)
+                nextRow = ws.LastRowUsed().RowNumber() + 1
+            Else
+                wb = New XLWorkbook()
+                ws = wb.Worksheets.Add("轴承数据")
+                WriteHeaders(ws)
+                nextRow = 2
+            End If
+
+            Dim pageNum      As Integer = startPage
+            Dim totalWritten As Integer = nextRow - 2   ' 已有行数
+
+            ' ── 逐页采集并写入 ────────────────────────────────
+            Do
+                Console.Write($"第 {pageNum,5} 页  已写 {totalWritten,7} 条... ")
+
+                Dim arr As String(,)
+                Try
+                    arr = client.Search(
+                        model:=SearchModel,
+                        brand:=SearchBrand,
+                        matchMode:=MatchMode,
+                        page:=pageNum,
+                        timeoutSeconds:=120,
+                        maxConcurrent:=MaxConcurrent,
+                        enableTranslation:=False)
+                Catch ex As OperationCanceledException
+                    Console.WriteLine("超时，10 秒后重试...")
+                    Threading.Thread.Sleep(10000)
+                    Continue Do
+                Catch ex As Exception
+                    Console.WriteLine($"异常: {ex.Message}，10 秒后重试...")
+                    Threading.Thread.Sleep(10000)
+                    Continue Do
+                End Try
+
+                Dim n = arr.GetLength(0)
+                Console.WriteLine($"{n} 条  [{client.LastSearchInfo}]")
+
+                If n = 0 Then Exit Do   ' 已到最后一页或搜索无结果
+
+                ' 将本页数据写入工作表
+                For i = 0 To n - 1
+                    For col = 0 To 21
+                        ws.Cell(nextRow, col + 1).Value = arr(i, col)
+                    Next
+                    nextRow      += 1
+                    totalWritten += 1
+                Next
+
+                ' 每 SaveEveryPages 页保存一次（防止意外中断丢数据）
+                If pageNum Mod SaveEveryPages = 0 Then
+                    wb.SaveAs(OutputPath)
+                    File.WriteAllText(CheckpointFile, (pageNum + 1).ToString())
+                    Console.WriteLine($"          ✓ 已保存 {totalWritten} 条至 {OutputPath}")
+                End If
+
+                ' Session 过期：重新登录后继续
+                If client.LastSearchInfo = "Session过期" Then
+                    Console.WriteLine("          ⚠ Session 过期，正在重新登录...")
+                    If Not client.Login(Email, Password) Then
+                        Console.WriteLine("          重新登录失败，终止采集")
+                        Exit Do
+                    End If
+                End If
+
+                If n < 50 AndAlso client.LastSearchInfo <> "超时" Then Exit Do  ' 不足 50 条且非超时截断，才认定已到末页 = 最后一页
+
+                pageNum += 1
+                Threading.Thread.Sleep(300)     ' 礼貌性间隔，降低限速风险
+            Loop
+
+            ' ── 最终保存并清除断点 ───────────────────────────
+            wb.SaveAs(OutputPath)
+            wb.Dispose()
+            If File.Exists(CheckpointFile) Then File.Delete(CheckpointFile)
+
+            Console.WriteLine()
+            Console.WriteLine($"采集完成！共导出 {totalWritten} 条")
+            Console.WriteLine($"文件：{OutputPath}")
+
+        End Using
+
+        Console.Write("按任意键退出...")
+        Console.ReadKey()
+    End Sub
+
+    Private Sub WriteHeaders(ws As IXLWorksheet)
+        Dim headerRow = ws.Row(1)
+        headerRow.Style.Font.Bold = True
+        headerRow.Style.Fill.BackgroundColor = XLColor.LightSteelBlue
+        For j = 0 To Headers.Length - 1
+            ws.Cell(1, j + 1).Value = Headers(j)
+        Next
+        ws.SheetView.FreezeRows(1)  ' 冻结首行，滚动时表头始终可见
+    End Sub
+
+End Module
+```
+
+#### 3) 运行
+
+```
+dotnet run
+```
+
+#### 4) 中断与恢复
+
+直接 `Ctrl+C` 中断程序，下次运行时会自动从 `checkpoint.txt` 记录的页码继续，已写入的数据不会丢失。
+
+#### 5) 速度与时间估算
+
+| `maxConcurrent` | 速度 | 20 万条预计耗时 |
+|:---:|:---:|:---:|
+| `3` | ~0.75 条/秒 | ~74 小时 |
+| `5` | ~1.25 条/秒 | ~44 小时 |
+
+> 瓶颈在服务器响应，代码侧无法进一步优化。建议按品牌或型号前缀**分段采集**（多天完成），每段生成独立的 Excel 文件，最后手动合并。
+
+#### 6) 注意事项
+
+**依赖包（仅 Excel 导出功能需要）**
+
+| 包名 | 安装命令 | 说明 |
+|---|---|---|
+| `ClosedXML` | `dotnet add package ClosedXML` | 读写 `.xlsx` 文件，MIT 开源许可，无商业限制 |
+
+在代码文件顶部必须添加以下引用：
+
+```vb
+Imports ClosedXML.Excel
+Imports System.IO
+```
+
+**运行时注意事项**
+
+| 项目 | 说明 |
+|---|---|
+| **内存占用** | `XLWorkbook` 将所有已写行保留在内存中。20 万行时约占 **500 MB～1 GB RAM**，请勿在内存不足的机器上运行 |
+| **断点文件** | 中断时自动生成 `checkpoint.txt`（与 Excel 同目录）；下次启动自动读取并续传；采集完成后自动删除 |
+| **保存频率** | 每 20 页（约 1000 条）自动保存一次；如需更频繁保存可调小 `SaveEveryPages` 常量 |
+| **Session 过期** | 长时间采集时服务器可能使登录状态失效，代码会自动重新登录后继续 |
+| **文件路径** | 代码中 `ExcelPath` 和 `CheckpointPath` 为绝对路径，请按实际情况修改 |
+| **分段建议** | 采集量超过 5 万条时建议按品牌/型号前缀分段，每段独立输出一个 Excel 文件，最后手动合并，可有效降低单次内存峰值 |
 
 ---
 
@@ -1265,7 +1507,9 @@ End If
 
 ---
 
-## 已知脆弱性
+## 限制与注意事项
+
+### 已知脆弱性
 
 | # | 位置 | 描述 | 影响 |
 |:---:|---|---|:---:|
@@ -1273,9 +1517,7 @@ End If
 | F-2 | `ScanRowTexts` | 列表页折扣价依赖 DOM 顺序（划线原价须在现价之前）。详情页价格不受影响 | 低 |
 | F-3 | `AbfTranslator` | 多实例同时运行且均开翻译时，`trans_dict.txt` 可能写入重复词条（无跨进程锁）。重复无害 | 极低 |
 
----
-
-## 注意事项
+### 使用注意事项
 
 1. 用 `Using` 语句（或手动调用 `.Dispose()`）确保 `AbfClient` 和 `AbfTranslator` 被正确释放
 2. 建议用 `Try...Catch` 包裹 `Login()` 和 `Search()` 调用

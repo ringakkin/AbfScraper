@@ -148,18 +148,18 @@ Dim arr As String(,) = client.Search(
     page:=0)
 ```
 
-| 参数 | 类型 | 默认值 | 约束 | 不填时的效果 |
-|---|---|---|---|---|
-| `model` | String | **必填** | 不可省略；可传 `""` 表示不限型号 | 必须传入 |
-| `brand` | String | **必填** | 不可省略；可传 `""` 表示不限品牌 | 必须传入 |
-| `matchMode` | Integer | `1` | 仅 `0`/`1`/`2` 有效；**其他值自动回退为 `1`**（开头匹配） | 按型号前缀搜索 |
-| `timeoutSeconds` | Integer | `120` | `0` 或负数 = 无限等待；正整数 = 超时秒数 | 120 秒超时；数据量大时建议手动调大，如 `600` |
-| `maxResults` | Integer | `0` | `0` 或负数 = 不限制；正整数 N = 最多返回 N 条 | 不限制，返回全部命中结果（受超时控制） |
-| `enableTranslation` | Boolean | `False` | 设 `True` 时须先在构造函数中配置百度 AppId/SecretKey，否则中文部分为空 | 不翻译；英中字段格式为 `"英文\|"`，中文部分为空 |
-| `imageSavePath` | String | `""` | 留空不下载；非空时目录不存在会自动创建 | 不下载图片；`arr(i,20)` 仍返回文件名，但文件不在磁盘上 |
-| `maxConcurrent` | Integer | `1` | `≤1` = 串行；建议 `2`~`3`；超过 `5` 收益递减且可能触发服务器限速 | 串行，最稳定但最慢 |
-| `onProgress` | Action(Of Integer, Integer) | `Nothing` | 可传 `Nothing`（VBA 调用时传 `Nothing`） | 无进度反馈 |
-| `page` | Integer | `0` | `0` = 自动翻全部页；正整数 N = 只抓第 N 页（每页 50 条） | 自动翻全部页直到搜完或超时 |
+| 参数 | 说明 | 类型 | 默认值 | 约束 | 不填时的效果 |
+|---|---|---|---|---|---|
+| `model` | 要搜索的轴承型号 | String | **必填** | 不可省略；可传 `""` 表示不限型号 | 必须传入 |
+| `brand` | 要搜索的品牌名称 | String | **必填** | 不可省略；可传 `""` 表示不限品牌 | 必须传入 |
+| `matchMode` | 型号匹配方式：0=包含、1=开头匹配、2=完全相等 | Integer | `1` | 仅 `0`/`1`/`2` 有效；**其他值自动回退为 `1`**（开头匹配） | 按型号前缀搜索 |
+| `timeoutSeconds` | **每次** `Search()` 调用的最长等待秒数，超时后返回已抓到的部分数据 | Integer | `120` | `0` 或负数 = 无限等待；正整数 = 超时秒数 | 120 秒超时；数据量大时建议手动调大，如 `600` |
+| `maxResults` | 最多返回多少条结果 | Integer | `0` | `0` 或负数 = 不限制；正整数 N = 最多返回 N 条 | 不限制，返回全部命中结果（受超时控制） |
+| `enableTranslation` | 是否将英文字段翻译为中文 | Boolean | `False` | 设 `True` 时须先在构造函数中配置百度 AppId/SecretKey，否则中文部分为空 | 不翻译；英中字段格式为 `"英文\|"`，中文部分为空 |
+| `imageSavePath` | 图片下载保存路径，留空则不下载 | String | `""` | 留空不下载；非空时目录不存在会自动创建 | 不下载图片；`arr(i,20)` 仍返回文件名，但文件不在磁盘上 |
+| `maxConcurrent` | 同时抓取多少条详情页（并发数），越大越快，但过高可能被服务器限速 | Integer | `1` | `≤1` = 串行；建议 `2`~`3`；超过 `5` 收益递减且可能触发服务器限速 | 串行，最稳定但最慢 |
+| `onProgress` | 进度回调函数，每抓完一页触发一次 | Action(Of Integer, Integer) | `Nothing` | 可传 `Nothing`（VBA 调用时传 `Nothing`） | 无进度反馈 |
+| `page` | 分页控制：0=自动抓全部页，N=只抓第 N 页（每页 50 条） | Integer | `0` | `0` = 自动翻全部页；正整数 N = 只抓第 N 页（每页 50 条） | 自动翻全部页直到搜完或超时 |
 
 > ⚠️ `model` 和 `brand` **不建议同时为空**。两者均为空时相当于搜索全站，命中数可能超过数十万条；配合 `maxResults` 或 `timeoutSeconds` 加以限制，否则程序会长时间运行并消耗大量内存。
 
@@ -504,6 +504,13 @@ Module PagedCrawl
 
                 Dim n = arr.GetLength(0)
                 Console.WriteLine($"{n} 条  [{client.LastSearchInfo}]")
+
+                ' Session 过期：先检查，避免被 n=0 的 Exit Do 遮蔽
+                If client.LastSearchInfo = "Session过期" Then
+                    client.Login("your@email.com", "your_password")
+                    Continue Do
+                End If
+
                 If n = 0 Then Exit Do
 
                 ' 写入本页数据（Tab 分隔，避免与价格中的逗号冲突）
@@ -521,11 +528,6 @@ Module PagedCrawl
 
                 ' 当页不足 50 条且非超时截断，才认定已到末页
                 If n < 50 AndAlso client.LastSearchInfo <> "超时" Then Exit Do
-
-                ' Session 过期时重新登录
-                If client.LastSearchInfo = "Session过期" Then
-                    client.Login("your@email.com", "your_password")
-                End If
 
                 pageNum += 1
                 Threading.Thread.Sleep(500)
@@ -683,6 +685,16 @@ Module BulkExportToExcel
                 Dim n = arr.GetLength(0)
                 Console.WriteLine($"{n} 条  [{client.LastSearchInfo}]")
 
+                ' Session 过期：先检查，避免被 n=0 的 Exit Do 遮蔽
+                If client.LastSearchInfo = "Session过期" Then
+                    Console.WriteLine("          ⚠ Session 过期，正在重新登录...")
+                    If Not client.Login(Email, Password) Then
+                        Console.WriteLine("          重新登录失败，终止采集")
+                        Exit Do
+                    End If
+                    Continue Do
+                End If
+
                 If n = 0 Then Exit Do   ' 已到最后一页或搜索无结果
 
                 ' 将本页数据写入工作表
@@ -699,15 +711,6 @@ Module BulkExportToExcel
                     wb.SaveAs(OutputPath)
                     File.WriteAllText(CheckpointFile, (pageNum + 1).ToString())
                     Console.WriteLine($"          ✓ 已保存 {totalWritten} 条至 {OutputPath}")
-                End If
-
-                ' Session 过期：重新登录后继续
-                If client.LastSearchInfo = "Session过期" Then
-                    Console.WriteLine("          ⚠ Session 过期，正在重新登录...")
-                    If Not client.Login(Email, Password) Then
-                        Console.WriteLine("          重新登录失败，终止采集")
-                        Exit Do
-                    End If
                 End If
 
                 If n < 50 AndAlso client.LastSearchInfo <> "超时" Then Exit Do  ' 不足 50 条且非超时截断，才认定已到末页 = 最后一页

@@ -31,6 +31,7 @@ Imports HtmlAgilityPack
             "Weight (kg)", "Bore", "Seal", "Cage Type", "External Modification",
             "Basic Static Load Rating", "Basic Dynamic Load Rating",
             "Limiting Speed", "Reference Speed",
+            "Special Treatment",
             "ECLASS", "ECLASS2"
         }
 
@@ -40,6 +41,12 @@ Imports HtmlAgilityPack
         Private ReadOnly _translator As AbfTranslator
         Private _enableTranslation As Boolean = False
         Private _searchTimeoutSec As Integer = 120
+        ' 并发详情页检测到 Session 过期时通过此标志通知 Search() 主线程（Interlocked 保证线程安全）
+        Private _sessionExpiredFlag As Integer = 0
+        ' 跨分页调用去重：page>0 时复用，model/brand/matchMode 变化时自动清空
+        Private _seenHrefs As New HashSet(Of String)
+        Private _seenNames As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Private _lastSearchKey As String = ""
 
         ''' <summary>
         ''' 上次 Search() 调用的停止原因。可能值：
@@ -112,6 +119,7 @@ Imports HtmlAgilityPack
                 Throw New ArgumentException("password 不能为空", NameOf(password))
             End If
 
+            Dim loginSuccess As Boolean = False
             Using loginCts As New System.Threading.CancellationTokenSource(
                     TimeSpan.FromSeconds(120))
 
@@ -155,9 +163,10 @@ Imports HtmlAgilityPack
                 End Using
 
                 ' 响应 JSON 示例：{"IsValid":true,"RedirectUri":null,...}
-                _isLoggedIn = Regex.IsMatch(body,
+                loginSuccess = Regex.IsMatch(body,
                     """IsValid""\s*:\s*true",
                     RegexOptions.IgnoreCase)
+                If loginSuccess Then _isLoggedIn = True   ' 失败时保留上次登录状态，避免 Search() 抛 InvalidOperationException
 
                 ' ── Step 3：登录成功后确保货币为 EUR ──
                 If _isLoggedIn Then
@@ -178,7 +187,7 @@ Imports HtmlAgilityPack
 
             End Using
 
-            Return _isLoggedIn
+            Return loginSuccess
         End Function
 
         ''' <summary>
@@ -214,6 +223,7 @@ Imports HtmlAgilityPack
             _searchTimeoutSec = timeoutSeconds
             _enableTranslation = enableTranslation
             LastSearchInfo = "OK"
+            System.Threading.Interlocked.Exchange(_sessionExpiredFlag, 0)
             If Not _isLoggedIn Then
                 Throw New InvalidOperationException(
                     "尚未登录，请先调用 Login() 方法。")
@@ -234,7 +244,15 @@ Imports HtmlAgilityPack
             ' os=库存过滤器：0=全部 1=有货 2=限时优惠，固定为 0（不过滤）
             Const PageSize As Integer = 50
             Dim rowMeta As New Dictionary(Of String, String())
-            Dim seen As New HashSet(Of String)
+            ' 分页模式（page>0）复用成员 _seenHrefs，避免跨页重复；全量模式每次新建
+            Dim searchKey = $"{model}|{brand}|{matchMode}"
+            If page <= 0 OrElse page = 1 OrElse searchKey <> _lastSearchKey Then
+                _seenHrefs.Clear()
+                _seenNames.Clear()
+                _lastSearchKey = searchKey
+            End If
+            Dim seen As HashSet(Of String) = _seenHrefs
+            Dim seenNames As HashSet(Of String) = _seenNames
             Dim pageNum As Integer = If(page > 0, page, 1)
             Dim totalProductCount As Integer = 0
             Dim results As New List(Of BearingResult)
@@ -243,7 +261,7 @@ Imports HtmlAgilityPack
             Do
                 Dim searchUrl = $"{BaseUrl}/s/en/search/" &
                                 $"?st=text&t={matchParam}&q={query}" &
-                                $"&ob=0&vw=basic&os=0&mx={PageSize}&p={pageNum}"
+                                $"&ob=1&vw=basic&os=0&mx={PageSize}&p={pageNum}"
 
                 ' ── 列表页抓取（最多重试 3 次，全部失败则返回已有部分结果）──
                 Dim html As String = ""
@@ -294,12 +312,15 @@ Imports HtmlAgilityPack
                     "//li[contains(@class,'result-row')]")
                 Dim rawRowCount As Integer = If(rows IsNot Nothing, rows.Count, 0)
 
-                ' ── 检测 Session 是否过期（服务器返回了登录页而非搜索结果页）──
+                ' ── 检测 Session 是否过期 / 服务器返回错误页 ──
+                ' 已知三种异常页面：
+                '   1. "Oops, something went wrong"（列表页 Session 失效）
+                '   2. "Page not found"（详情页 Session 失效）
+                '   3. 登录页（含 input[type='password']）
                 If rawRowCount = 0 Then
-                    Dim loginIndicator = doc.DocumentNode.SelectSingleNode(
-                        "//input[@type='password']")
-                    If loginIndicator IsNot Nothing Then
-                        _isLoggedIn = False
+                    If html.IndexOf("something went wrong", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+                       html.IndexOf("Page not found", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+                       doc.DocumentNode.SelectSingleNode("//input[@type='password']") IsNot Nothing Then
                         LastSearchInfo = "Session过期"
                         Exit Do
                     End If
@@ -318,7 +339,7 @@ Imports HtmlAgilityPack
                                                StringComparison.OrdinalIgnoreCase) AndAlso
                                Not href.Contains("?") AndAlso
                                Not href.Contains("#") Then
-                                rowHref = href
+                                rowHref = href.TrimEnd("/"c).ToLowerInvariant()
                                 ' 取 <a> 内文本，包含 <span class="highlight">（搜索词高亮）
                                 ' 但排除 <span class="product-desc">aka ...</span>
                                 Dim txtParts As New System.Text.StringBuilder()
@@ -340,6 +361,9 @@ Imports HtmlAgilityPack
                     End If
                     If String.IsNullOrEmpty(rowHref) Then Continue For
                     If Not seen.Add(rowHref) Then Continue For
+                    ' 产品名去重：同一产品可能存在不同 URL slug，仅靠 href 无法识别
+                    If Not String.IsNullOrEmpty(listResultName) AndAlso
+                       Not seenNames.Add(listResultName) Then Continue For
                     pageHrefs.Add(rowHref)
 
                     ' ── 从行内文本提取库存、价格、简述 ──
@@ -367,6 +391,7 @@ Imports HtmlAgilityPack
                 End If
 
                 ' ── 立即抓取本页的详情页（支持并发） ──
+                Dim resultsBeforePage = results.Count
                 ' 先按 maxResults 截断本页 href 列表
                 Dim batchHrefs = If(maxResults > 0 AndAlso pageHrefs.Count > maxResults - results.Count,
                                     pageHrefs.GetRange(0, Math.Max(0, maxResults - results.Count)),
@@ -428,6 +453,25 @@ Imports HtmlAgilityPack
                         If r IsNot Nothing Then results.Add(r)
                     Next
                     resultIndex += batchHrefs.Count
+                End If
+
+                ' ── 检测并发详情页中是否有 Session 过期 ──
+                ' 回滚本页所有数据（丢弃错误行），并从去重集合中移除本页 href/name，
+                ' 确保客户端重登录后重试同一页时能重新采集
+                If System.Threading.Interlocked.CompareExchange(_sessionExpiredFlag, 0, 0) = 1 Then
+                    If results.Count > resultsBeforePage Then
+                        results.RemoveRange(resultsBeforePage, results.Count - resultsBeforePage)
+                    End If
+                    For Each h In pageHrefs
+                        seen.Remove(h)
+                        Dim meta() As String = Nothing
+                        If rowMeta.TryGetValue(h, meta) AndAlso meta.Length > 3 AndAlso
+                           Not String.IsNullOrEmpty(meta(3)) Then
+                            seenNames.Remove(meta(3))
+                        End If
+                    Next
+                    LastSearchInfo = "Session过期"
+                    Exit Do
                 End If
 
                 ' ── 进度回调（每页详情抓完后触发）──
@@ -504,6 +548,16 @@ Imports HtmlAgilityPack
             Dim doc As New HtmlDocument()
             doc.LoadHtml(html)
 
+            ' ── 检测 Session 是否过期 / 服务器返回错误页 ──
+            If html.IndexOf("Page not found", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+               html.IndexOf("something went wrong", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+               doc.DocumentNode.SelectSingleNode("//input[@type='password']") IsNot Nothing Then
+                ' 通知 Search() 主线程：本批次有详情页 Session 过期
+                System.Threading.Interlocked.Exchange(_sessionExpiredFlag, 1)
+                result.ShortDescription = "[Session过期] 详情页返回错误页面"
+                Return result
+            End If
+
             ' 产品名称（h1）
             Dim h1 = doc.DocumentNode.SelectSingleNode("//h1")
             If h1 IsNot Nothing Then
@@ -512,11 +566,10 @@ Imports HtmlAgilityPack
 
             ' 键值对解析
             ' HTML 结构：
-            '   <li class="flex border-top border-light-gray py1">
-            '     <span class="col-4 pr2 italic">Label</span>   ← Specifications/Properties
-            '     <span class="col-8">Value</span>
-            '   </li>
-            ' Suffix description 节的标签列为 col-2，值列为 col-10，同样处理。
+            '   Specifications / Product Properties：标签 col-4 italic，值 col-8
+            '   Suffix description：              标签 col-2 italic，值 col-10
+            ' 两者用值列宽度区分，分别存入 RawData 和 suffixRaw
+            Dim suffixRaw As New List(Of KeyValuePair(Of String, String))
             Dim liNodes = doc.DocumentNode.SelectNodes(
                 "//li[contains(@class,'flex')" &
                 " and contains(@class,'border-top')" &
@@ -526,19 +579,20 @@ Imports HtmlAgilityPack
                 For Each li In liNodes
                     Dim labelNode = li.SelectSingleNode(
                         "./span[contains(@class,'italic')]")
-                    Dim valueNode = li.SelectSingleNode(
-                        "./span[contains(@class,'col-8')" &
-                        " or contains(@class,'col-10')]")
+                    Dim propNode = li.SelectSingleNode(
+                        "./span[contains(@class,'col-8')]")
+                    Dim sufxNode = li.SelectSingleNode(
+                        "./span[contains(@class,'col-10')]")
 
-                    If labelNode IsNot Nothing AndAlso
-                       valueNode IsNot Nothing Then
-                        Dim label = HtmlEntity.DeEntitize(
-                                        labelNode.InnerText.Trim())
-                        Dim value = HtmlEntity.DeEntitize(
-                                        valueNode.InnerText.Trim())
-                        If Not String.IsNullOrWhiteSpace(label) Then
-                            result.RawData(label) = value
-                        End If
+                    If labelNode Is Nothing Then Continue For
+                    Dim label = HtmlEntity.DeEntitize(labelNode.InnerText.Trim())
+                    If String.IsNullOrWhiteSpace(label) Then Continue For
+
+                    If propNode IsNot Nothing Then
+                        result.RawData(label) = HtmlEntity.DeEntitize(propNode.InnerText.Trim())
+                    ElseIf sufxNode IsNot Nothing Then
+                        suffixRaw.Add(New KeyValuePair(Of String, String)(
+                            label, HtmlEntity.DeEntitize(sufxNode.InnerText.Trim())))
                     End If
                 Next
             End If
@@ -692,18 +746,14 @@ Imports HtmlAgilityPack
                 End If
             End If
 
-            ' SuffixDescription：将所有后缀 key=value 拼接，格式：后缀1=说明1|后缀2=说明2|…
-            ' 后缀条目特征：不属于常规 Specifications 字段，且 key 往往是简短大写编码
-            ' 此处简化规则：不属于已知字段的 RawData 条目就当作后缀拆分拼入
+            ' SuffixDescription：直接来自网站 Suffix description 节（col-10），与 Product Properties 完全隔离
+            ' 格式：KEY|英文说明|中文说明|KEY|英文说明|中文说明|…
             Dim suffixParts As New List(Of String)
-            For Each kv In result.RawData
-                If Not KnownRawKeys.Contains(kv.Key) Then
-                    ' 格式：KEY|英文|中文
-                    Dim keyVal = kv.Key
-                    Dim engVal = kv.Value
-                    Dim zhVal = Translate(engVal, ct)
-                    suffixParts.Add($"{keyVal}|{engVal}|{zhVal}")
-                End If
+            For Each kv In suffixRaw
+                Dim keyVal = kv.Key
+                Dim engVal = kv.Value
+                Dim zhVal  = Translate(engVal, ct)
+                suffixParts.Add($"{keyVal}|{engVal}|{zhVal}")
             Next
             result.SuffixDescription = If(suffixParts.Count > 0, String.Join("|", suffixParts), "|")
 
@@ -1022,12 +1072,27 @@ Imports HtmlAgilityPack
                     .Replace("&#X20AC;", ChrW(8364))
         End Function
 
-        ''' <summary>带超时的 HTTP GET 请求，返回响应文本。</summary>
+        ''' <summary>
+        ''' 带超时的 HTTP GET 请求，返回响应文本。
+        ''' 非 2xx 时若 body 包含已知错误页面标识（Session 过期/服务器错误页），
+        ''' 仍返回 body 让调用方通过内容检测处理；其余 HTTP 错误照常抛异常。
+        ''' </summary>
         Private Function FetchHtml(url As String, Optional ct As System.Threading.CancellationToken = Nothing) As String
             Using resp = _http.GetAsync(url, ct).GetAwaiter().GetResult()
-                resp.EnsureSuccessStatusCode()
                 Dim bytes = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-                Return System.Text.Encoding.UTF8.GetString(bytes)
+                Dim body = System.Text.Encoding.UTF8.GetString(bytes)
+                If Not resp.IsSuccessStatusCode Then
+                    ' 已知 Session 过期 / 服务器错误页面：返回 body，让上层 Session 检测逻辑处理
+                    If body.IndexOf("something went wrong", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+                       body.IndexOf("Page not found", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+                       body.IndexOf("type=""password""", StringComparison.OrdinalIgnoreCase) >= 0 OrElse
+                       body.IndexOf("type='password'", StringComparison.OrdinalIgnoreCase) >= 0 Then
+                        Return body
+                    End If
+                    ' 非已知错误页面的 HTTP 失败：抛异常，走重试逻辑
+                    resp.EnsureSuccessStatusCode()
+                End If
+                Return body
             End Using
         End Function
 
